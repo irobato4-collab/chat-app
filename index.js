@@ -7,13 +7,23 @@ const fs = require("fs");
 const path = require("path");
 
 app.use(express.static("public"));
+app.use(express.json());
 
 /* ===== 設定 ===== */
 const FILE = "messages.json";
 const MAX_MESSAGES = 100;
-const ADMIN_PASSWORD = "40311882"; // ← 必ず変更してください
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 
 let users = {}; // socket.id -> { name, color, avatar }
+
+/* ===== 入室認証 ===== */
+app.post("/auth", (req, res) => {
+  if (req.body.password === process.env.ENTRY_PASSWORD) {
+    res.json({ ok: true });
+  } else {
+    res.json({ ok: false });
+  }
+});
 
 /* ===== messages.json 安全読み込み ===== */
 function loadMessages() {
@@ -74,7 +84,6 @@ io.on("connection", (socket) => {
       text: msg.text
     });
 
-    // ★ 100件を超えたら古い順に削除
     while (data.length > MAX_MESSAGES) {
       data.shift();
     }
