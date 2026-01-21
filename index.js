@@ -1,9 +1,10 @@
 // index.js
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const fs = require("fs");
-const crypto = require("crypto");
+import express from "express";
+import http from "http";
+import { Server } from "socket.io";
+import fs from "fs";
+import crypto from "crypto";
+import fetch from "node-fetch";
 
 const app = express();
 const server = http.createServer(app);
@@ -12,126 +13,112 @@ const io = new Server(server);
 app.use(express.static("public"));
 app.use(express.json());
 
-/* ===== 設定 ===== */
+/* =====================
+   設定
+===================== */
 const LOCAL_FILE = "messages.json";
 
 const {
-  ENTRY_PASSWORD,
-  ADMIN_PASSWORD,
-  GITHUB_TOKEN,
+  GITHUB_OWNER,
   GITHUB_REPO,
   GITHUB_FILE,
-  SECRET_KEY
+  GITHUB_TOKEN,
+  SECRET_KEY,
+  ADMIN_PASSWORD,
+  ENTRY_PASSWORD
 } = process.env;
 
-if (!SECRET_KEY || SECRET_KEY.length < 32) {
-  throw new Error("SECRET_KEY must be 32+ chars");
-}
-
-/* ===== メモリ ===== */
-let users = {};
+/* =====================
+   メモリ
+===================== */
 let messages = [];
+let users = {};
 
-/* ===== 暗号化 ===== */
-function encrypt(data) {
+/* =====================
+   暗号化 / 復号
+===================== */
+function encrypt(text) {
   const iv = crypto.randomBytes(16);
   const key = crypto.createHash("sha256").update(SECRET_KEY).digest();
-  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
-
-  const enc = Buffer.concat([
-    cipher.update(JSON.stringify(data), "utf8"),
-    cipher.final()
-  ]);
-
-  return JSON.stringify({
-    iv: iv.toString("hex"),
-    tag: cipher.getAuthTag().toString("hex"),
-    data: enc.toString("hex")
-  });
+  const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+  const enc = Buffer.concat([cipher.update(text), cipher.final()]);
+  return iv.toString("hex") + ":" + enc.toString("hex");
 }
 
-function decrypt(enc) {
-  const obj = JSON.parse(enc);
+function decrypt(text) {
+  const [ivHex, dataHex] = text.split(":");
+  const iv = Buffer.from(ivHex, "hex");
+  const data = Buffer.from(dataHex, "hex");
   const key = crypto.createHash("sha256").update(SECRET_KEY).digest();
-
-  const decipher = crypto.createDecipheriv(
-    "aes-256-gcm",
-    key,
-    Buffer.from(obj.iv, "hex")
-  );
-  decipher.setAuthTag(Buffer.from(obj.tag, "hex"));
-
-  const dec = Buffer.concat([
-    decipher.update(Buffer.from(obj.data, "hex")),
-    decipher.final()
-  ]);
-
-  return JSON.parse(dec.toString("utf8"));
+  const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+  return Buffer.concat([decipher.update(data), decipher.final()]).toString();
 }
 
-/* ===== GitHub API ===== */
-async function githubRequest(method, body) {
-  const res = await fetch(
-    `https://api.github.com/repos/${GITHUB_REPO}/contents/${GITHUB_FILE}`,
-    {
-      method,
-      headers: {
-        Authorization: `Bearer ${GITHUB_TOKEN}`,
-        Accept: "application/vnd.github+json"
-      },
-      body: body ? JSON.stringify(body) : undefined
-    }
-  );
-  return res.ok ? res.json() : null;
-}
+/* =====================
+   GitHub API
+===================== */
+const GH_HEADERS = {
+  Authorization: `token ${GITHUB_TOKEN}`,
+  "User-Agent": "chat-backup",
+  Accept: "application/vnd.github+json"
+};
 
-/* ===== GitHub → 復元 ===== */
 async function restoreFromGitHub() {
-  const file = await githubRequest("GET");
-  if (!file?.content) return;
+  const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_FILE}`;
+  const res = await fetch(url, { headers: GH_HEADERS });
+  if (!res.ok) {
+    console.log("⚠ GitHub backup not found");
+    return;
+  }
 
-  const decoded = Buffer.from(file.content, "base64").toString();
-  messages = decrypt(decoded);
+  const json = await res.json();
+  const encrypted = Buffer.from(json.content, "base64").toString();
+  const decrypted = decrypt(encrypted);
+  messages = JSON.parse(decrypted);
 
   fs.writeFileSync(LOCAL_FILE, JSON.stringify(messages, null, 2));
-  console.log("Restored from GitHub");
 }
 
-/* ===== GitHub ← バックアップ ===== */
 async function backupToGitHub() {
-  const encrypted = encrypt(messages);
-  const file = await githubRequest("GET");
+  const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_FILE}`;
 
-  await githubRequest("PUT", {
-    message: "backup messages",
-    content: Buffer.from(encrypted).toString("base64"),
-    sha: file?.sha
+  let sha = null;
+  const check = await fetch(url, { headers: GH_HEADERS });
+  if (check.ok) sha = (await check.json()).sha;
+
+  const encrypted = encrypt(JSON.stringify(messages));
+  const content = Buffer.from(encrypted).toString("base64");
+
+  await fetch(url, {
+    method: "PUT",
+    headers: GH_HEADERS,
+    body: JSON.stringify({
+      message: "backup messages",
+      content,
+      sha
+    })
   });
 
-  console.log("Backup to GitHub complete");
+  console.log("☁ GitHub backup updated");
 }
 
-/* ===== 起動処理 ===== */
-(async () => {
-  if (fs.existsSync(LOCAL_FILE)) {
-    messages = JSON.parse(fs.readFileSync(LOCAL_FILE, "utf8"));
-  } else {
-    await restoreFromGitHub();
-  }
-})();
-
-/* ===== 認証 ===== */
+/* =====================
+   入室認証
+===================== */
 app.post("/auth", (req, res) => {
   res.json({ ok: req.body.password === ENTRY_PASSWORD });
 });
 
-/* ===== socket.io ===== */
+/* =====================
+   socket.io
+===================== */
 io.on("connection", (socket) => {
+  console.log("connect:", socket.id);
+
   socket.emit("history", messages);
 
-  socket.on("userJoin", (user) => {
-    users[socket.id] = user;
-    io.emit("userList", Object.values(users));
+  socket.on("userJoin", (u) => {
+    users[socket.id] = u;
   });
 
   socket.on("chat message", (msg) => {
@@ -141,32 +128,48 @@ io.on("connection", (socket) => {
   });
 
   socket.on("requestDelete", (id) => {
+    const user = users[socket.id];
+    const msg = messages.find(m => m.id === id);
+    if (!user || !msg || msg.name !== user.name) return;
+
     messages = messages.filter(m => m.id !== id);
     fs.writeFileSync(LOCAL_FILE, JSON.stringify(messages, null, 2));
     io.emit("delete message", id);
   });
 
-  socket.on("adminClearAll", async (password) => {
+  socket.on("adminClearAll", (password) => {
     if (password !== ADMIN_PASSWORD) return;
     messages = [];
     fs.writeFileSync(LOCAL_FILE, "[]");
-    await backupToGitHub();
     io.emit("clearAllMessages");
+    backupToGitHub();
   });
 
   socket.on("disconnect", async () => {
     delete users[socket.id];
-    io.emit("userList", Object.values(users));
-
-    // ★ 誰もいなくなった瞬間バックアップ
     if (Object.keys(users).length === 0) {
       await backupToGitHub();
     }
   });
 });
 
-/* ===== 起動 ===== */
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log("Server running on", PORT);
-});
+/* =====================
+   起動（最重要）
+===================== */
+async function boot() {
+  console.log("⏳ restoring messages...");
+  if (fs.existsSync(LOCAL_FILE)) {
+    messages = JSON.parse(fs.readFileSync(LOCAL_FILE));
+    console.log("✅ loaded local messages");
+  } else {
+    await restoreFromGitHub();
+    console.log("✅ restored from GitHub");
+  }
+
+  const PORT = process.env.PORT || 3000;
+  server.listen(PORT, () => {
+    console.log("🚀 Server started on port", PORT);
+  });
+}
+
+boot();
