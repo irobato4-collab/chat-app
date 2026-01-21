@@ -3,150 +3,179 @@ import express from "express";
 import http from "http";
 import { Server } from "socket.io";
 import crypto from "crypto";
+import fetch from "node-fetch";
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-/* ===== 設定 ===== */
-const MAX_MESSAGES = 100;
-
-// env
-const {
-  GITHUB_TOKEN,
-  GITHUB_OWNER,
-  GITHUB_REPO,
-  GITHUB_BRANCH,
-  GITHUB_FILE,
-  SECRET_KEY,
-  ADMIN_PASSWORD,
-  ENTRY_PASSWORD,
-  PORT
-} = process.env;
-
 app.use(express.static("public"));
 app.use(express.json());
 
-let users = {}; // socket.id -> user
+/* =====================
+   環境変数
+===================== */
+const PORT = process.env.PORT || 3000;
 
-/* ===== 暗号化ユーティリティ ===== */
-const ALGO = "aes-256-gcm";
-const KEY = crypto.createHash("sha256").update(SECRET_KEY).digest();
+const GITHUB_TOKEN = process.env.GITHUB_TOKEN;
+const GITHUB_REPO = process.env.GITHUB_REPO; // owner/repo
+const GITHUB_PATH = process.env.GITHUB_PATH || "messages.enc.json";
+const SECRET_KEY = process.env.SECRET_KEY; // 32文字推奨
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 
+const MAX_MESSAGES = 100;
+
+/* =====================
+   暗号化 / 復号
+===================== */
 function encrypt(text) {
-  const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv(ALGO, KEY, iv);
-  const encrypted = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
-  const tag = cipher.getAuthTag();
-  return Buffer.concat([iv, tag, encrypted]).toString("base64");
+  const iv = crypto.randomBytes(16);
+  const key = crypto.createHash("sha256").update(SECRET_KEY).digest();
+  const cipher = crypto.createCipheriv("aes-256-cbc", key, iv);
+  let enc = cipher.update(text, "utf8", "base64");
+  enc += cipher.final("base64");
+  return iv.toString("base64") + ":" + enc;
 }
 
 function decrypt(enc) {
-  const buf = Buffer.from(enc, "base64");
-  const iv = buf.subarray(0, 12);
-  const tag = buf.subarray(12, 28);
-  const data = buf.subarray(28);
-  const decipher = crypto.createDecipheriv(ALGO, KEY, iv);
-  decipher.setAuthTag(tag);
-  return Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
+  const [ivStr, data] = enc.split(":");
+  const iv = Buffer.from(ivStr, "base64");
+  const key = crypto.createHash("sha256").update(SECRET_KEY).digest();
+  const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+  let dec = decipher.update(data, "base64", "utf8");
+  dec += decipher.final("utf8");
+  return dec;
 }
 
-/* ===== GitHub API ===== */
-const GH_HEADERS = {
-  Authorization: `Bearer ${GITHUB_TOKEN}`,
-  "Content-Type": "application/json"
-};
-
-const GH_URL = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_FILE}?ref=${GITHUB_BRANCH}`;
+/* =====================
+   GitHub API
+===================== */
+const api = "https://api.github.com";
 
 async function loadMessages() {
   try {
-    const res = await fetch(GH_URL, { headers: GH_HEADERS });
+    const res = await fetch(
+      `${api}/repos/${GITHUB_REPO}/contents/${GITHUB_PATH}`,
+      {
+        headers: {
+          Authorization: `Bearer ${GITHUB_TOKEN}`,
+          Accept: "application/vnd.github+json"
+        }
+      }
+    );
+
     if (res.status === 404) return [];
 
     const json = await res.json();
-    const decrypted = decrypt(Buffer.from(json.content, "base64").toString());
-    return JSON.parse(decrypted);
+    const decoded = Buffer.from(json.content, "base64").toString("utf8");
+    return JSON.parse(decrypt(decoded));
   } catch (e) {
     console.error("loadMessages error:", e);
     return [];
   }
 }
 
-async function saveMessages(messages) {
-  const encrypted = encrypt(JSON.stringify(messages));
-  const content = Buffer.from(encrypted).toString("base64");
+async function saveMessages(data) {
+  try {
+    const body = encrypt(JSON.stringify(data));
+    let sha = null;
 
-  let sha = undefined;
-  const res = await fetch(GH_URL, { headers: GH_HEADERS });
-  if (res.ok) {
-    const json = await res.json();
-    sha = json.sha;
-  }
+    const check = await fetch(
+      `${api}/repos/${GITHUB_REPO}/contents/${GITHUB_PATH}`,
+      {
+        headers: {
+          Authorization: `Bearer ${GITHUB_TOKEN}`,
+          Accept: "application/vnd.github+json"
+        }
+      }
+    );
 
-  await fetch(
-    `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${GITHUB_FILE}`,
-    {
-      method: "PUT",
-      headers: GH_HEADERS,
-      body: JSON.stringify({
-        message: "update messages",
-        content,
-        branch: GITHUB_BRANCH,
-        sha
-      })
+    if (check.ok) {
+      sha = (await check.json()).sha;
     }
-  );
+
+    await fetch(
+      `${api}/repos/${GITHUB_REPO}/contents/${GITHUB_PATH}`,
+      {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${GITHUB_TOKEN}`,
+          Accept: "application/vnd.github+json"
+        },
+        body: JSON.stringify({
+          message: "update messages",
+          content: Buffer.from(body).toString("base64"),
+          sha
+        })
+      }
+    );
+  } catch (e) {
+    console.error("saveMessages error:", e);
+  }
 }
 
-/* ===== 入室認証 ===== */
-app.post("/auth", (req, res) => {
-  res.json({ ok: req.body.password === ENTRY_PASSWORD });
-});
+/* =====================
+   メモリキャッシュ（高速用）
+===================== */
+let messageCache = await loadMessages();
+if (messageCache.length > MAX_MESSAGES) {
+  messageCache = messageCache.slice(-MAX_MESSAGES);
+}
 
-/* ===== socket.io ===== */
-io.on("connection", async (socket) => {
-  console.log("connected:", socket.id);
+/* =====================
+   socket.io
+===================== */
+io.on("connection", (socket) => {
+  console.log("connect:", socket.id);
 
-  socket.emit("history", await loadMessages());
+  // 履歴送信
+  socket.emit("history", messageCache);
 
-  socket.on("userJoin", (user) => {
-    users[socket.id] = user;
-    io.emit("userList", Object.values(users));
-  });
+  // メッセージ受信
+  socket.on("chat message", (msg) => {
+    messageCache.push(msg);
 
-  socket.on("chat message", async (msg) => {
-    let data = await loadMessages();
-
-    data.push(msg);
-    if (data.length > MAX_MESSAGES) {
-      data = data.slice(-MAX_MESSAGES);
+    if (messageCache.length > MAX_MESSAGES) {
+      messageCache = messageCache.slice(-MAX_MESSAGES);
     }
 
-    await saveMessages(data);
+    // 🔥 即時表示（超高速）
     io.emit("chat message", msg);
+
+    // 🔥 裏で保存（遅くてもOK）
+    saveMessages(messageCache);
   });
 
-  socket.on("requestDelete", async (id) => {
-    let data = await loadMessages();
-    data = data.filter(m => m.id !== id);
-    await saveMessages(data);
+  // 個別削除
+  socket.on("requestDelete", (id) => {
+    messageCache = messageCache.filter(m => m.id !== id);
+
     io.emit("delete message", id);
+    saveMessages(messageCache);
   });
 
-  socket.on("adminClearAll", async (password) => {
-    if (password !== ADMIN_PASSWORD) return;
-    await saveMessages([]);
+  // 管理者：全削除
+  socket.on("adminClearAll", (password) => {
+    if (password !== ADMIN_PASSWORD) {
+      socket.emit("adminClearFailed", "管理者パスワードが違います");
+      return;
+    }
+
+    messageCache = [];
     io.emit("clearAllMessages");
+    saveMessages(messageCache);
+
+    console.log("admin cleared all");
   });
 
   socket.on("disconnect", () => {
-    delete users[socket.id];
-    io.emit("userList", Object.values(users));
+    console.log("disconnect:", socket.id);
   });
 });
 
-/* ===== 起動 ===== */
-server.listen(PORT || 3000, () => {
-  console.log("Server running");
+/* =====================
+   起動
+===================== */
+server.listen(PORT, () => {
+  console.log("Server running on port", PORT);
 });
