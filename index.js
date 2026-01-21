@@ -3,146 +3,138 @@ const express = require("express");
 const app = express();
 const http = require("http").createServer(app);
 const io = require("socket.io")(http);
-const fs = require("fs");
-const path = require("path");
+const crypto = require("crypto");
+const fetch = (...args) =>
+  import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
 app.use(express.static("public"));
 app.use(express.json());
 
 /* ===== 設定 ===== */
-const FILE = "messages.json";
 const MAX_MESSAGES = 100;
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const {
+  GITHUB_TOKEN,
+  GITHUB_REPO,
+  GITHUB_FILE,
+  ENTRY_PASSWORD,
+  ADMIN_PASSWORD,
+  SECRET_KEY
+} = process.env;
 
-let users = {}; // socket.id -> { name, color, avatar }
+const users = {};
 
-/* ===== 入室認証 ===== */
-app.post("/auth", (req, res) => {
-  if (req.body.password === process.env.ENTRY_PASSWORD) {
-    res.json({ ok: true });
-  } else {
-    res.json({ ok: false });
-  }
-});
+/* ===== 暗号化 ===== */
+const ALGO = "aes-256-gcm";
+const KEY = crypto.createHash("sha256").update(SECRET_KEY).digest();
 
-/* ===== messages.json 安全読み込み ===== */
-function loadMessages() {
+function encrypt(text) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv(ALGO, KEY, iv);
+  const enc = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, enc]).toString("base64");
+}
+
+function decrypt(data) {
+  const buf = Buffer.from(data, "base64");
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const text = buf.subarray(28);
+  const decipher = crypto.createDecipheriv(ALGO, KEY, iv);
+  decipher.setAuthTag(tag);
+  return decipher.update(text, null, "utf8") + decipher.final("utf8");
+}
+
+/* ===== GitHub API ===== */
+const GH_API = `https://api.github.com/repos/${GITHUB_REPO}/contents/${GITHUB_FILE}`;
+
+async function loadMessages() {
   try {
-    if (!fs.existsSync(FILE)) {
-      fs.writeFileSync(FILE, "[]");
-      return [];
-    }
-    const raw = fs.readFileSync(FILE, "utf8");
-    if (!raw.trim()) return [];
-    return JSON.parse(raw);
+    const r = await fetch(GH_API, {
+      headers: {
+        Authorization: `Bearer ${GITHUB_TOKEN}`,
+        Accept: "application/vnd.github+json"
+      }
+    });
+
+    if (r.status === 404) return [];
+
+    const j = await r.json();
+    const decrypted = decrypt(Buffer.from(j.content, "base64").toString());
+    return JSON.parse(decrypted);
   } catch (e) {
     console.error("loadMessages error:", e);
-    fs.writeFileSync(FILE, "[]");
     return [];
   }
 }
 
-function saveMessages(data) {
-  fs.writeFileSync(FILE, JSON.stringify(data, null, 2), "utf8");
+async function saveMessages(data) {
+  const encrypted = encrypt(JSON.stringify(data));
+  const content = Buffer.from(encrypted).toString("base64");
+
+  let sha = null;
+  const r = await fetch(GH_API, {
+    headers: { Authorization: `Bearer ${GITHUB_TOKEN}` }
+  });
+  if (r.ok) sha = (await r.json()).sha;
+
+  await fetch(GH_API, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${GITHUB_TOKEN}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      message: "update messages",
+      content,
+      sha
+    })
+  });
 }
 
-/* ===== 起動時に履歴整理（100件超え防止） ===== */
-(function normalizeMessages() {
-  let data = loadMessages();
-  if (data.length > MAX_MESSAGES) {
-    data = data.slice(data.length - MAX_MESSAGES);
-    saveMessages(data);
-  }
-})();
+/* ===== 入室認証 ===== */
+app.post("/auth", (req, res) => {
+  res.json({ ok: req.body.password === ENTRY_PASSWORD });
+});
 
 /* ===== socket.io ===== */
-io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
+io.on("connection", async (socket) => {
+  socket.emit("history", await loadMessages());
 
-  // 履歴送信
-  socket.emit("history", loadMessages());
-
-  // ユーザー参加
-  socket.on("userJoin", (user) => {
-    users[socket.id] = {
-      name: user.name,
-      color: user.color,
-      avatar: user.avatar || null
-    };
+  socket.on("userJoin", (u) => {
+    users[socket.id] = u;
     io.emit("userList", Object.values(users));
   });
 
-  // メッセージ受信
-  socket.on("chat message", (msg) => {
-    let data = loadMessages();
-
-    data.push({
-      id: msg.id,
-      name: msg.name,
-      color: msg.color,
-      avatar: msg.avatar ?? null,
-      text: msg.text
-    });
-
-    while (data.length > MAX_MESSAGES) {
-      data.shift();
+  socket.on("chat message", async (msg) => {
+    let data = await loadMessages();
+    data.push(msg);
+    if (data.length > MAX_MESSAGES) {
+      data = data.slice(-MAX_MESSAGES);
     }
-
-    saveMessages(data);
+    await saveMessages(data);
     io.emit("chat message", msg);
   });
 
-  // 個別削除（本人のみ）
-  socket.on("requestDelete", (id) => {
-    const currentUser = users[socket.id];
-    if (!currentUser) {
-      socket.emit("deleteFailed", { id, reason: "not-joined" });
-      return;
-    }
-
-    let data = loadMessages();
-    const msg = data.find(m => m.id === id);
-    if (!msg) {
-      socket.emit("deleteFailed", { id, reason: "not-found" });
-      return;
-    }
-
-    const sameName = msg.name === currentUser.name;
-    const sameAvatar = (msg.avatar || null) === (currentUser.avatar || null);
-    const sameColor = msg.color === currentUser.color;
-
-    if (!(sameName && (sameAvatar || sameColor))) {
-      socket.emit("deleteFailed", { id, reason: "not-owner" });
-      return;
-    }
-
+  socket.on("requestDelete", async (id) => {
+    let data = await loadMessages();
     data = data.filter(m => m.id !== id);
-    saveMessages(data);
+    await saveMessages(data);
     io.emit("delete message", id);
   });
 
-  // ★ 管理者：全削除
-  socket.on("adminClearAll", (password) => {
-    if (password !== ADMIN_PASSWORD) {
-      socket.emit("adminClearFailed", "管理者パスワードが違います");
-      return;
-    }
-
-    saveMessages([]);
+  socket.on("adminClearAll", async (pw) => {
+    if (pw !== ADMIN_PASSWORD) return;
+    await saveMessages([]);
     io.emit("clearAllMessages");
-    console.log("Admin cleared all messages");
   });
 
-  // 切断処理
   socket.on("disconnect", () => {
     delete users[socket.id];
     io.emit("userList", Object.values(users));
-    console.log("User disconnected:", socket.id);
   });
 });
 
-/* ===== サーバー起動 ===== */
+/* ===== 起動 ===== */
 const PORT = process.env.PORT || 3000;
-http.listen(PORT, () => {
-  console.log("Server running on port " + PORT);
-});
+http.listen(PORT, () => console.log("Server running:", PORT));
